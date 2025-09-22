@@ -23,4 +23,5 @@ RUN pip install --upgrade pip && \
 
 COPY . .
 
-CMD ["python", "main.py"]
+# Запуск в режиме демона для постоянной работы
+CMD ["python", "-u", "main.py"]

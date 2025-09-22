@@ -1,0 +1,48 @@
+name: build-plugin
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'BonusPaymentPlugin/**'
+      - '.github/workflows/build-plugin.yml'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Restore NuGet packages
+        working-directory: iiko-bonus-plugin/BonusPaymentPlugin
+        run: nuget restore BonusPaymentPlugin.csproj
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build Release
+        working-directory: iiko-bonus-plugin
+        run: msbuild iiko-bonus-plugin.sln /p:Configuration=Release /m
+
+      - name: Prepare artifact
+        shell: pwsh
+        run: |
+          $out = "iiko-bonus-plugin/BonusPaymentPlugin/bin/Release"
+          New-Item -ItemType Directory -Path artifact -Force | Out-Null
+          New-Item -ItemType Directory -Path artifact/BonusPaymentPlugin -Force | Out-Null
+          Copy-Item "$out/BonusPaymentPlugin.dll" artifact/BonusPaymentPlugin/ -Force
+          if (Test-Path "$out/BonusPaymentPlugin.dll.config") { Copy-Item "$out/BonusPaymentPlugin.dll.config" artifact/BonusPaymentPlugin/ -Force }
+          # Include config template if exists
+          if (Test-Path "iiko-bonus-plugin/BonusPaymentPlugin/App.config") {
+            Copy-Item "iiko-bonus-plugin/BonusPaymentPlugin/App.config" artifact/BonusPaymentPlugin/BonusPaymentPlugin.dll.config -Force
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BonusPaymentPlugin
+          path: artifact/BonusPaymentPlugin
