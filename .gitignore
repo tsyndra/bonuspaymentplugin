@@ -122,9 +122,6 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-# Docker
-.dockerignore
-
 # IDE
 .vscode/
 .idea/
@@ -142,3 +139,6 @@ nomenclature_cache.json
 nomenclature_cache_date.txt
 *.xlsx
 *.xls 
+*.pid
+*.png
+last_screenshot_minute.txt

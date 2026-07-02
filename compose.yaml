@@ -9,6 +9,7 @@
 # https://github.com/docker/awesome-compose
 services:
   server:
+    container_name: iiko-reporter
     build:
       context: .
     env_file:
@@ -17,7 +18,7 @@ services:
       - 8001:8000
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "ps", "aux", "|", "grep", "main.py", "|", "grep", "-v", "grep"]
+      test: ["CMD-SHELL", "ps aux | grep '[p]ython.*main.py' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3

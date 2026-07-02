@@ -1,30 +1,34 @@
-import sys
-print('DEBUG sys.argv:', sys.argv)
 import os
-import re
 import asyncio
-import requests
 from telegram import Bot
 from telegram.error import TelegramError
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, date, timedelta
 import json
 from dotenv import load_dotenv
 from telegram.ext import Application, CommandHandler
-import textwrap
 import aiohttp
 import pytz
-from time import sleep
 import signal
 from table_screenshot import create_table_screenshot
+from stoplist_logic import (
+    build_product_lookup,
+    build_report_text,
+    collect_stoplist_products,
+    extract_org_number,
+    should_skip_org,
+)
 
 
 class IikoReporter:
     def __init__(self):
+        load_dotenv()
         # Инициализация параметров из переменных окружения
         self.api_key = os.getenv('IIKO_API_KEY')
         self.telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
         self.chat_id = os.getenv('TELEGRAM_CHAT_ID')
         self.new_chat_id = os.getenv('TELEGRAM_NEW_CHAT_ID', '-1001507942384')
+        # Управление отправкой текстового отчёта в 12/17 (по умолчанию выключено)
+        self.send_report_12_17 = (os.getenv('SEND_REPORT_12_17', '0').lower() in ('1', 'true', 'yes', 'on'))
         
         if not all([self.api_key, self.telegram_token, self.chat_id]):
             raise ValueError("Не заданы обязательные переменные окружения")
@@ -46,11 +50,13 @@ class IikoReporter:
 
     async def start_scheduler(self):
         """Запуск планировщика в отдельной задаче"""
-        if not self.scheduler_running:
-            self.scheduler_running = True
-            # Запускаем планировщик напрямую, а не как task
-            print("Планировщик запущен")
-            await self._scheduler_loop()
+        if self.scheduler_running and self.scheduler_task and not self.scheduler_task.done():
+            return self.scheduler_task
+
+        self.scheduler_running = True
+        self.scheduler_task = asyncio.create_task(self._scheduler_loop())
+        print("Планировщик запущен")
+        return self.scheduler_task
 
     async def stop_scheduler(self):
         """Остановка планировщика"""
@@ -69,9 +75,9 @@ class IikoReporter:
 
     async def _scheduler_loop(self):
         """Основной цикл планировщика"""
-        print("🕐 Планировщик запущен: отправка стоп-листа каждый час с 11:00 по 22:00 по МСК")
-        print("🕐 Дополнительная отправка в новый чат в 12:00 и 17:00 по МСК")
-        print("📸 Отправка скриншотов таблицы в 12:00, 17:00, 18:00, 19:00, 20:00, 21:00 по МСК")
+        report_status = "включена" if self.send_report_12_17 else "выключена"
+        print(f"🕐 Планировщик запущен: отправка стоп-листа в 12:00 и 17:00 по МСК ({report_status}, только новый чат)")
+        print("📸 Отправка скриншотов таблицы в 12:00, 17:00, 18:00, 19:00, 20:00, 21:00, 21:30, 22:00 по МСК (через планировщик)")
         print("🕐 Обновление кеша номенклатуры каждый день в 00:00 по МСК")
         
         msk_tz = pytz.timezone('Europe/Moscow')
@@ -79,6 +85,24 @@ class IikoReporter:
         startup_check_done = False
         last_date = None
         
+        # Marker file to avoid duplicate screenshot sends per minute across multiple processes
+        screenshot_marker_path = os.path.join(os.getcwd(), "last_screenshot_minute.txt")
+        def _was_screenshot_sent_this_minute(now_dt):
+            try:
+                if not os.path.exists(screenshot_marker_path):
+                    return False
+                with open(screenshot_marker_path, "r", encoding="utf-8") as f:
+                    last = f.read().strip()
+                return last == now_dt.strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                return False
+        def _mark_screenshot_sent(now_dt):
+            try:
+                with open(screenshot_marker_path, "w", encoding="utf-8") as f:
+                    f.write(now_dt.strftime("%Y-%m-%d %H:%M"))
+            except Exception:
+                pass
+
         while self.scheduler_running:
             try:
                 now = datetime.now(msk_tz)
@@ -107,25 +131,33 @@ class IikoReporter:
                     else:
                         print("✅ Кэш номенклатуры актуален при запуске планировщика")
                 
-                # Проверяем, нужно ли отправить отчет (каждый час с 11 до 22)
-                # Исключаем 12:00 и 17:00, так как для них есть отдельная логика
-                if 11 <= current_hour <= 22 and current_minute == 0 and current_hour not in [12, 17]:
-                    print(f"🕐 Выполнение запланированной отправки стоп-листа в {now.strftime('%Y-%m-%d %H:%M:%S')} МСК")
-                    await self._send_scheduled_report()
+                # Отправка отчетов только в 12:00 и 17:00 (убрана отправка каждый час)
                 
-                # Проверяем, нужно ли отправить отчет в новый чат (12:00 и 17:00)
-                if current_hour in [12, 17] and current_minute == 0 and current_hour not in self.new_chat_sent_today:
+                # Проверяем, нужно ли отправить отчет в новый чат (12:00 и 17:00) — по флагу
+                if self.send_report_12_17 and current_hour in [12, 17] and current_minute == 0 and current_hour not in self.new_chat_sent_today:
                     print(f"🕐 УСЛОВИЕ СРАБОТАЛО: час={current_hour}, минута={current_minute}")
-                    print(f"🕐 Выполнение дополнительной отправки стоп-листа в новый чат в {now.strftime('%Y-%m-%d %H:%M:%S')} МСК")
+                    print(f"🕐 Выполнение отправки стоп-листа в новый чат в {now.strftime('%Y-%m-%d %H:%M:%S')} МСК")
+                    
+                    # Отправляем только в новый чат
                     await self._send_scheduled_report_to_new_chat()
+                    
                     self.new_chat_sent_today.add(current_hour)
                     print(f"✅ Отправка в новый чат в {current_hour}:00 отмечена как выполненная")
                 
-                # Проверяем, нужно ли отправить скриншот таблицы (12, 17, 18, 19, 20, 21)
-                table_screenshot_hours = [12, 17, 18, 19, 20, 21]
-                if current_hour in table_screenshot_hours and current_minute == 0:
-                    print(f"📸 Выполнение отправки скриншота таблицы в {now.strftime('%Y-%m-%d %H:%M:%S')} МСК")
-                    await self.send_table_screenshot()
+                # Проверяем, нужно ли отправить скриншот (12:00, 17:00, 18:00, 19:00, 20:00, 21:00, 21:30, 22:00)
+                should_send_screenshot = (
+                    (current_hour in [12, 17, 18, 19, 20, 22] and current_minute == 0) or
+                    (current_hour == 21 and current_minute in [0, 30])
+                )
+                if should_send_screenshot:
+                    # One-per-minute guard across multiple processes
+                    if _was_screenshot_sent_this_minute(now):
+                        print(f"⏭️ Скриншот уже был отправлен в {now.strftime('%Y-%m-%d %H:%M')} — пропуск для предотвращения дубликатов")
+                    else:
+                        print(f"📸 Отправляем скриншот таблицы в {now.strftime('%Y-%m-%d %H:%M:%S')} МСК")
+                        ok = await self.send_table_screenshot()
+                        if ok:
+                            _mark_screenshot_sent(now)
                 
                 # Проверяем, нужно ли обновить кеш (в полночь или если кеш устарел)
                 should_update_cache = False
@@ -169,18 +201,10 @@ class IikoReporter:
                 await asyncio.sleep(60)
 
     async def _send_scheduled_report(self):
-        """Отправка запланированного отчета"""
-        try:
-            moscow_time = datetime.now(pytz.timezone('Europe/Moscow'))
-            print(f"🕐 Выполнение запланированной отправки стоп-листа в {moscow_time.strftime('%Y-%m-%d %H:%M:%S')} МСК")
-            print(f"🕐 UTC время: {datetime.now(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S')}")
-            
-            await self.run_report()
-            print(f"✅ Запланированная отправка стоп-листа завершена успешно")
-        except Exception as e:
-            error_msg = f"❌ Ошибка при выполнении запланированной отправки: {str(e)}"
-            print(error_msg)
-            # НЕ отправляем ошибки в чат - только логируем
+        """DEPRECATED: Отправка запланированного отчета в старый чат - больше не используется"""
+        print("⚠️ ВНИМАНИЕ: Отправка в старый чат отключена!")
+        print("📋 Отчеты теперь отправляются только в новый чат")
+        # Метод оставлен для совместимости, но не выполняет никаких действий
 
     async def _send_scheduled_report_to_new_chat(self):
         """Отправка запланированного отчета в новый чат"""
@@ -423,17 +447,11 @@ class IikoReporter:
 
     def extract_org_number(self, org_name):
         """Извлечение номера из названия организации."""
-        # Ищем паттерн "число. название" в начале строки
-        match = re.match(r'^(\d+)\.\s*', org_name)
-        if match:
-            return int(match.group(1))
-        # Если нет паттерна "число.", ищем любое число в названии
-        numbers = re.findall(r'\d+', org_name)
-        return int(numbers[0]) if numbers else 0
+        return extract_org_number(org_name)
 
     async def send_telegram_message(self, text, chat_id=None):
         """Отправка сообщения в Telegram."""
-        target_chat_id = chat_id or self.chat_id
+        target_chat_id = chat_id or self.new_chat_id  # По умолчанию отправляем в новый чат
         try:
             await self.bot.send_message(
                 chat_id=target_chat_id,
@@ -528,38 +546,9 @@ class IikoReporter:
             # Получаем номенклатуру по всем организациям (пустой список productIds - получим всю номенклатуру)
             nomenclature = await self.get_products_info(token, [], force_update=force_update_nomenclature)
             
-            # Создаем словарь productId -> название блюда
-            product_id_to_name = {}
-            product_id_to_category = {}
-            category_id_to_name = {}
-            
-            # Создаем словарь категорий
-            for cat in nomenclature.get("productCategories", []):
-                category_id_to_name[cat["id"]] = cat["name"].lower()
-            
-            # Создаем словари для продуктов
-            for product in nomenclature.get("products", []):
-                product_id = product["id"]
-                product_name = product["name"]
-                category_id = product.get("productCategoryId")
-                category_name = category_id_to_name.get(category_id, "").lower()
-                
-                product_id_to_name[product_id] = product_name
-                product_id_to_category[product_id] = category_name
+            product_id_to_name, product_id_to_category = build_product_lookup(nomenclature)
             
             print(f"Загружено {len(product_id_to_name)} продуктов из номенклатуры")
-            
-            # Список исключений
-            exclude_categories = [
-                "десерты", "десерты понедельник", "десерты вторник", 
-                "десерты среда", "десерты четверг", "пиво", "соусы"
-            ]
-            exclude_dishes = [
-                "рис острый", "индиан тоник", "сырный соус", "хлебная корзинка", 
-                "сырный heinz", "хлебная белая корзинка", "хлебная ч/б корзинка", 
-                "хлебная черная корзинка"
-            ]
-            exclude_orgs = ["кожуховская", "рязань", "наметкина"]
             
             # Собираем отчеты по организациям
             org_reports = {}
@@ -576,7 +565,7 @@ class IikoReporter:
                     continue
                 
                 # Пропускаем исключенные организации
-                if any(ex in org_name.lower() for ex in exclude_orgs):
+                if should_skip_org(org_name):
                     print(f"Пропускаем организацию: {org_name}")
                     continue
                 
@@ -585,44 +574,11 @@ class IikoReporter:
                 # Получаем стоп-лист организации
                 stop_list = await self.get_stop_list(token, org_id)
                 
-                org_products = []
-                
-                # Обрабатываем стоп-лист
-                for group in stop_list.get("terminalGroupStopLists", []):
-                    for terminal in group.get("items", []):
-                        for item in terminal.get("items", []):
-                            if not isinstance(item, dict):
-                                continue
-                            
-                            # Включаем все товары из стоп-листа (независимо от остатка)
-                            # balance может быть 0 (нет в наличии) или больше 0 (есть остаток)
-                            
-                            product_id = item.get("productId")
-                            if not product_id:
-                                continue
-                            
-                            # Получаем название блюда из номенклатуры
-                            product_name = product_id_to_name.get(product_id)
-                            if not product_name:
-                                print(f"Не найдено название для productId: {product_id}")
-                                continue
-                            
-                            # Получаем категорию блюда
-                            category = product_id_to_category.get(product_id, "")
-                            
-                            # Пропускаем исключенные категории
-                            if category in exclude_categories:
-                                continue
-                            
-                            # Пропускаем исключенные блюда
-                            if any(excluded_dish.lower() in product_name.lower() for excluded_dish in exclude_dishes):
-                                continue
-                            
-                            # Пропускаем напитки, кроме морса
-                            if category == "напитки" and "морс" not in product_name.lower():
-                                continue
-                            
-                            org_products.append(product_name)
+                org_products = collect_stoplist_products(
+                    stop_list,
+                    product_id_to_name,
+                    product_id_to_category,
+                )
                 
                 # Добавляем в отчет, если есть товары в стоп-листе
                 if org_products:
@@ -642,22 +598,7 @@ class IikoReporter:
             
             print("Формирование и отправка отчета...")
             
-            # Формируем текстовый отчет
-            report_text = "📋 Отчет по стоп-листам:\n\n"
-            
-            # Сортируем организации по номеру
-            sorted_orgs = sorted(org_reports.items(), key=lambda x: self.extract_org_number(x[0]))
-            
-            for org_name, products in sorted_orgs:
-                # Извлекаем номер и название филиала
-                org_number = self.extract_org_number(org_name)
-                # Убираем номер из названия для отображения
-                display_name = re.sub(r'^\d+\.\s*', '', org_name)
-                
-                report_text += f"🏪 {org_number}. {display_name}:\n"
-                for product in sorted(products):
-                    report_text += f"• {product}\n"
-                report_text += "\n"
+            report_text = build_report_text(org_reports)
             
             # Разбиваем на части, если сообщение слишком длинное
             max_length = 4096
@@ -732,8 +673,8 @@ async def help_command(update, context):
         "/help — справка\n"
         "/ping — проверить, что бот работает\n\n"
         "📅 **Автоматическая отправка:**\n"
-        "• Стоп-лист отправляется каждый час с 11:00 по 22:00 по МСК (основной чат)\n"
-        "• Дополнительная отправка в новый чат в 12:00 и 17:00 по МСК\n"
+        "• Стоп-лист отправляется в 12:00 и 17:00 МСК только при SEND_REPORT_12_17=1\n"
+        "• Скриншоты таблицы отправляются в 12:00, 17:00, 18:00, 19:00, 20:00, 21:00, 21:30, 22:00 по МСК\n"
         "• Кеш номенклатуры обновляется каждый день в 00:00 по МСК\n\n"
         "💡 **Примечание:**\n"
         "• /report использует кешированную номенклатуру (быстрее)\n"
@@ -757,49 +698,30 @@ async def schedule_command(update, context):
     if reporter.scheduler_running:
         schedule_text += "✅ **Планировщик активен**\n\n"
         schedule_text += "📋 **Запланированные задачи:**\n"
-        schedule_text += "• Отправка стоп-листа: каждый час с 11:00 по 22:00 МСК (основной чат)\n"
-        schedule_text += "• Дополнительная отправка в новый чат: 12:00 и 17:00 МСК\n"
+        report_status = "включена" if reporter.send_report_12_17 else "выключена"
+        schedule_text += f"• Отправка стоп-листа: 12:00 и 17:00 МСК, только новый чат ({report_status})\n"
+        schedule_text += "• Скриншоты таблицы: 12:00, 17:00, 18:00, 19:00, 20:00, 21:00, 21:30, 22:00 МСК\n"
         schedule_text += "• Обновление кеша номенклатуры: каждый день в 00:00 МСК\n\n"
         
-        # Показываем следующее время отправки
-        current_hour = moscow_time.hour
-        current_minute = moscow_time.minute
-        
-        # Определяем следующее время отправки в основной чат
-        if 11 <= current_hour <= 22:
-            if current_minute == 0:
-                next_report_hour = current_hour + 1 if current_hour < 22 else 11
-            else:
-                next_report_hour = current_hour
-            next_report_time = moscow_time.replace(hour=next_report_hour, minute=0, second=0, microsecond=0)
-            if current_hour == 22 and current_minute == 0:
-                next_report_time += timedelta(days=1)
-            schedule_text += f"🕐 Следующий отчет (основной чат): {next_report_time.strftime('%d.%m.%Y %H:%M:%S')} МСК\n"
+        def next_scheduled_time(schedule):
+            candidates = []
+            for hour, minute in schedule:
+                candidate = moscow_time.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if candidate <= moscow_time:
+                    candidate += timedelta(days=1)
+                candidates.append(candidate)
+            return min(candidates)
+
+        next_screenshot_time = next_scheduled_time([
+            (12, 0), (17, 0), (18, 0), (19, 0), (20, 0), (21, 0), (21, 30), (22, 0)
+        ])
+        schedule_text += f"🕐 Следующий скриншот: {next_screenshot_time.strftime('%d.%m.%Y %H:%M:%S')} МСК\n"
+
+        if reporter.send_report_12_17:
+            next_report_time = next_scheduled_time([(12, 0), (17, 0)])
+            schedule_text += f"🕐 Следующий стоп-лист: {next_report_time.strftime('%d.%m.%Y %H:%M:%S')} МСК\n"
         else:
-            next_report_time = moscow_time.replace(hour=11, minute=0, second=0, microsecond=0)
-            if current_hour >= 23 or current_hour < 11:
-                next_report_time += timedelta(days=1)
-            schedule_text += f"🕐 Следующий отчет (основной чат): {next_report_time.strftime('%d.%m.%Y %H:%M:%S')} МСК\n"
-        
-        # Определяем следующее время отправки в новый чат
-        if current_hour in [12, 17]:
-            if current_minute == 0:
-                next_new_chat_hour = 17 if current_hour == 12 else 12
-                next_new_chat_time = moscow_time.replace(hour=next_new_chat_hour, minute=0, second=0, microsecond=0)
-                if current_hour == 17:
-                    next_new_chat_time += timedelta(days=1)
-            else:
-                next_new_chat_time = moscow_time.replace(hour=current_hour, minute=0, second=0, microsecond=0)
-            schedule_text += f"🕐 Следующий отчет (новый чат): {next_new_chat_time.strftime('%d.%m.%Y %H:%M:%S')} МСК\n"
-        elif current_hour < 12:
-            next_new_chat_time = moscow_time.replace(hour=12, minute=0, second=0, microsecond=0)
-            schedule_text += f"🕐 Следующий отчет (новый чат): {next_new_chat_time.strftime('%d.%m.%Y %H:%M:%S')} МСК\n"
-        elif current_hour < 17:
-            next_new_chat_time = moscow_time.replace(hour=17, minute=0, second=0, microsecond=0)
-            schedule_text += f"🕐 Следующий отчет (новый чат): {next_new_chat_time.strftime('%d.%m.%Y %H:%M:%S')} МСК\n"
-        else:
-            next_new_chat_time = moscow_time.replace(hour=12, minute=0, second=0, microsecond=0) + timedelta(days=1)
-            schedule_text += f"🕐 Следующий отчет (новый чат): {next_new_chat_time.strftime('%d.%m.%Y %H:%M:%S')} МСК\n"
+            schedule_text += "🕐 Следующий стоп-лист: выключен переменной `SEND_REPORT_12_17`\n"
     else:
         schedule_text += "❌ **Планировщик неактивен**\n\n"
         schedule_text += "Используйте /restart_schedule для запуска"
@@ -879,8 +801,7 @@ async def post_init(application):
         print("✅ Кэш номенклатуры актуален")
     
     # Запускаем планировщик как task
-    scheduler_task = asyncio.create_task(reporter._scheduler_loop())
-    reporter.scheduler_running = True
+    await reporter.start_scheduler()
     print("✅ Планировщик запущен")
 
 async def test_report():
@@ -942,9 +863,9 @@ async def test_report():
                     if count >= 3:
                         break
         
-        # Запускаем полный отчет
-        print("\n📊 Запускаем полный отчет...")
-        await reporter.run_report()
+        # Запускаем полный отчет в новый чат
+        print("\n📊 Запускаем полный отчет в новый чат...")
+        await reporter.run_report(target_chat_id=reporter.new_chat_id)
         print("✅ Отчет завершен")
         
     except Exception as e:
@@ -1047,7 +968,6 @@ if __name__ == "__main__":
     load_dotenv()
     import sys
     import asyncio
-    print('sys.argv:', sys.argv)
     # Проверяем аргументы командной строки
     if len(sys.argv) > 1 and sys.argv[1] == "test":
         print("Запуск тестового режима...")

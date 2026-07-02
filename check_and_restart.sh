@@ -1,26 +1,28 @@
 #!/bin/bash
+set -euo pipefail
 
 # Скрипт для проверки и перезапуска iiko-reporter бота
 # Запускается через cron каждые 5 минут
 
-CONTAINER_NAME="iiko-reporter_server_1"
-WORKDIR="/home/workdir/iiko-reporter"
+CONTAINER_NAME="${CONTAINER_NAME:-iiko-reporter}"
+WORKDIR="${WORKDIR:-/home/workdir/iiko-reporter}"
+COMPOSE="docker compose"
 
 cd "$WORKDIR" || exit 1
 
 # Проверяем, запущен ли контейнер
-if ! docker ps --format "table {{.Names}}" | grep -q "^${CONTAINER_NAME}$"; then
+if ! docker ps --format "{{.Names}}" | grep -qx "$CONTAINER_NAME"; then
     echo "$(date): Контейнер $CONTAINER_NAME не запущен. Перезапускаем..."
     
     # Останавливаем все контейнеры проекта
-    docker-compose down
+    $COMPOSE down
     
     # Запускаем заново
-    docker-compose up -d
+    $COMPOSE up -d
     
     # Проверяем, что запустился
     sleep 10
-    if docker ps --format "table {{.Names}}" | grep -q "^${CONTAINER_NAME}$"; then
+    if docker ps --format "{{.Names}}" | grep -qx "$CONTAINER_NAME"; then
         echo "$(date): ✅ Контейнер успешно перезапущен"
     else
         echo "$(date): ❌ Ошибка при перезапуске контейнера"

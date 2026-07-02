@@ -6,13 +6,17 @@
 import asyncio
 import os
 from playwright.async_api import async_playwright
-from datetime import datetime
 
 class TableScreenshotMaker:
     def __init__(self):
-        self.username = 'tsyndra'
-        self.password = 'NgTYSasz06GtpplZ'
-        self.url = 'https://callcenter.hatimaki.ru'
+        self.username = os.getenv('TABLE_SCREENSHOT_USERNAME')
+        self.password = os.getenv('TABLE_SCREENSHOT_PASSWORD')
+        self.url = os.getenv('TABLE_SCREENSHOT_URL', 'https://callcenter.hatimaki.ru').rstrip('/')
+        if not self.username or not self.password:
+            raise ValueError(
+                "Не заданы TABLE_SCREENSHOT_USERNAME/TABLE_SCREENSHOT_PASSWORD. "
+                "Смените скомпрометированный пароль и укажите новые данные в .env."
+            )
         
     async def take_table_screenshot(self, output_path='table.png'):
         """Создает скриншот таблицы"""
@@ -50,7 +54,7 @@ class TableScreenshotMaker:
                     
                     # Ищем все таблицы
                     table_headers = await page.query_selector_all('.terminals-column-header')
-                    all_rows = await page.query_selector_all('.hover-block.terminal.with-kz')
+                    all_rows = await page.query_selector_all('.hover-block.terminal')
                     
                     print(f"Найдено заголовков таблиц: {len(table_headers)}")
                     print(f"Найдено строк таблиц: {len(all_rows)}")

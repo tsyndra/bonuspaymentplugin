@@ -30,31 +30,32 @@
 
 ## Логи
 
-- **Логи бота**: `docker logs iiko-reporter_server_1`
+- **Логи бота**: `docker logs iiko-reporter`
 - **Логи мониторинга**: `tail -f bot_monitor.log`
 
 ## Команды управления
 
 ```bash
 # Запуск
-docker-compose up -d
+docker compose up -d
 
 # Остановка
-docker-compose down
+docker compose down
 
 # Перезапуск
-docker-compose restart
+docker compose restart
 
 # Просмотр статуса
 docker ps | grep iiko
 
 # Просмотр логов
-docker logs -f iiko-reporter_server_1
+docker logs -f iiko-reporter
 ```
 
 ## Расписание работы
 
-- **Отправка стоп-листа**: каждый час с 11:00 по 22:00 по МСК
+- **Отправка стоп-листа**: только в 12:00 и 17:00 по МСК (только новый чат)
+- **Скриншоты таблицы**: 12:00, 17:00, 18:00, 19:00, 20:00, 21:00, 21:30, 22:00 по МСК (новый чат)
 - **Обновление кеша**: каждый день в 00:00 по МСК
 - **Проверка мониторинга**: каждые 5 минут
 
@@ -67,10 +68,10 @@ docker logs -f iiko-reporter_server_1
 
 2. Если нужно принудительный перезапуск:
    ```bash
-   docker-compose down && docker-compose up -d
+   docker compose down && docker compose up -d
    ```
 
 3. Проверка переменных окружения:
    ```bash
-   docker exec iiko-reporter_server_1 env | grep -E "(TELEGRAM|IIKO)"
+   docker exec iiko-reporter env | grep -E "(TELEGRAM|IIKO|TABLE_SCREENSHOT)"
    ```
