@@ -142,3 +142,6 @@ nomenclature_cache_date.txt
 *.pid
 *.png
 last_screenshot_minute.txt
+
+# Nested repo (committed separately)
+XBscreen/

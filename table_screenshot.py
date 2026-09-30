@@ -5,7 +5,76 @@
 
 import asyncio
 import os
+import signal
+import time
 from playwright.async_api import async_playwright
+
+_CHROMIUM_COMMS = frozenset({
+    "chrome",
+    "chromium",
+    "chromium-browser",
+    "headless_shell",
+    "chrome_crashpad",
+})
+
+
+def _direct_child_pids():
+    my_pid = os.getpid()
+    found = set()
+    try:
+        for tid in os.listdir(f"/proc/{my_pid}/task"):
+            try:
+                with open(f"/proc/{my_pid}/task/{tid}/children", encoding="utf-8") as f:
+                    for token in f.read().split():
+                        try:
+                            found.add(int(token))
+                        except ValueError:
+                            pass
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return list(found)
+
+
+def _proc_comm(pid: int) -> str:
+    try:
+        with open(f"/proc/{pid}/comm", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _reap_exited_children() -> int:
+    reaped = 0
+    while True:
+        try:
+            pid, _status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            break
+        if pid == 0:
+            break
+        reaped += 1
+    return reaped
+
+
+def _cleanup_leftover_chromium() -> None:
+    """SIGKILL unreaped Chromium children after Playwright close, then wait()."""
+    targets = [pid for pid in _direct_child_pids() if _proc_comm(pid) in _CHROMIUM_COMMS]
+    for pid in targets:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if _reap_exited_children() == 0 and not [
+            pid for pid in _direct_child_pids() if _proc_comm(pid) in _CHROMIUM_COMMS
+        ]:
+            break
+        time.sleep(0.05)
+    _reap_exited_children()
+
 
 class TableScreenshotMaker:
     def __init__(self):
@@ -126,7 +195,14 @@ class TableScreenshotMaker:
                     return False
                 
                 finally:
-                    await browser.close()
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+                    try:
+                        await asyncio.wait_for(browser.close(), timeout=20)
+                    except Exception:
+                        pass
         
         except Exception as e:
             # Если это ошибка Playwright о отсутствующем браузере, но скриншот все равно создался
@@ -141,6 +217,12 @@ class TableScreenshotMaker:
             else:
                 print(f"❌ Общая ошибка при создании скриншота: {error_msg}")
                 return False
+        finally:
+            # After playwright context exits: reap any leftover Chromium zombies.
+            try:
+                await asyncio.to_thread(_cleanup_leftover_chromium)
+            except Exception:
+                pass
 
 async def create_table_screenshot(output_path='table.png'):
     """Функция для создания скриншота таблицы"""
